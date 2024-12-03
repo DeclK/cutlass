@@ -100,17 +100,14 @@ gemm_device(ProblemShape shape_MNK, CtaTiler cta_tiler,
   Tensor mC = make_tensor(make_gmem_ptr(C), select<0,1>(shape_MNK), dC); // (M,N)
 
   // Get the appropriate blocks for this thread block
-  // take gA as an example: mA shape (M, K), cta_tiler shape (BLK_M, BLK_N, BLK_K)
   // so when try to tile it with step<_1, X, _1>, it will first tile it in a sub-tensor mA_tiled ((BLK_M, BLK_K), (m, k))
-  // m = M // BLK_M, k = K // BLK_K = 4096 // 8 = 512 (in this case)
   // then we try to slice it with the coord (blockIdx.x, blockIdx.y, _) in the rest-mode(second-mode)
   // the _ means that for the k dimension, we will take all the elements, similar : in the pytorch
-  // so we are actually doing this
-  // gA = mA_tiled[:, :, blockIdx.x, :]
-  auto cta_coord = make_coord(blockIdx.x, blockIdx.y, _);              // (m,n,k)
-  Tensor gA = local_tile(mA, cta_tiler, cta_coord, Step<_1, X,_1>{});  // (BLK_M,BLK_K,k)
-  Tensor gB = local_tile(mB, cta_tiler, cta_coord, Step< X,_1,_1>{});  // (BLK_N,BLK_K,k)
-  Tensor gC = local_tile(mC, cta_tiler, cta_coord, Step<_1,_1, X>{});  // (BLK_M,BLK_N)
+  // so we are actually doing this: gA = mA_tiled[:, :, x, :]
+  auto cta_coord = make_coord(blockIdx.x, blockIdx.y, _);              // (x,y,_)
+  Tensor gA = local_tile(mA, cta_tiler, cta_coord, Step<_1, X,_1>{});  // (BLK_M,BLK_K,k) i.e. (128, 8, 512)
+  Tensor gB = local_tile(mB, cta_tiler, cta_coord, Step< X,_1,_1>{});  // (BLK_N,BLK_K,k) i.e. (128, 8, 512)
+  Tensor gC = local_tile(mC, cta_tiler, cta_coord, Step<_1,_1, X>{});  // (BLK_M,BLK_N)   i.e. (128, 128)
 
   // Shared memory buffers
   __shared__ TA smemA[cosize_v<ASmemLayout>];
@@ -122,23 +119,18 @@ gemm_device(ProblemShape shape_MNK, CtaTiler cta_tiler,
   // Partition the copying of A and B tiles across the threads
   //
 
-  // TUTORIAL: Example of simple raked partitioning of ThreadLayouts tA|tB over data A|B tiles
-  // gA layout: (BLK_M, BLK_K, k), if there is no stride, there should be a default stride LayoutLeft or LayoutRight?
-  // tA layout: (THR_M, THR_K)
-  // local_partition is a lot like local_tile, first we tile the tensor, then we slice it in the first mode
+  // local_partition is a lot like local_tile, first we tile the tensor, then we still slice in the first mode
   // gA_tiled = ((THR_M, THR_K), (thr_m, thr_k, k))
-  // Note that the threadIdx.x will be converted into a coord (x, y)
-  // then we slice it at the fist-model (tile-mode)
-  // gA = gA_tiled[x, y, :, :, :], now the shape is (thr_m, thr_k, k) which is different from original code comment
-  // question is why slice it at the first-mode? how does the coord (x, y) calculated?  
+  // Note that the threadIdx.x will be converted into a coord (x, y) automatically
+  // we slice it at the fist-mode (tile-mode) gA = gA_tiled[x, y, :, :, :]
 
   // gA is the tiled tensor in this block, and tA is this thread
   // so tAgA basically means the single tensor allocated for a single tensor
   Tensor tAgA = local_partition(gA, tA, threadIdx.x);                  // (thr_m,thr_k,k) i.e. (4, 1, 512)
-  Tensor tAsA = local_partition(sA, tA, threadIdx.x);                  // (thr_m,thr_k) i.e. (4, 1)
+  Tensor tAsA = local_partition(sA, tA, threadIdx.x);                  // (thr_m,thr_k)   i.e. (4, 1)
 
   Tensor tBgB = local_partition(gB, tB, threadIdx.x);                  // (thr_n,thr_k,k) i.e. (4, 1, 512)
-  Tensor tBsB = local_partition(sB, tB, threadIdx.x);                  // (THR_N,THR_K) i.e. (4, 1)
+  Tensor tBsB = local_partition(sB, tB, threadIdx.x);                  // (THR_N,THR_K)   i.e. (4, 1)
 
   CUTE_STATIC_ASSERT_V(size<0>(tAgA) == size<0>(tAsA));                // THR_M
   CUTE_STATIC_ASSERT_V(size<1>(tAgA) == size<1>(tAsA));                // THR_K
@@ -149,21 +141,15 @@ gemm_device(ProblemShape shape_MNK, CtaTiler cta_tiler,
   // Define A/B partitioning and C accumulators
   //
 
-  // TUTORIAL: Example of partitioning via projections of a ThreadLayout tC
-
-  // Partition sA (M,K) by the rows of tC
-  // sA (128, 8) tC (16, 16)
-  // tCsA (16, 128 // 16, 8) -> (16, 8, 8)
-  // tCsA[x, :] -> (8, 8)
+  // Partition sA(BLK_M,BLK_K) by the rows of tC(THR_M,THR_N)
+  // (128, 8) -> ((16), (8, 8)) -> (8, 8)
   Tensor tCsA = local_partition(sA, tC, threadIdx.x, Step<_1, X>{});   // (8, 8)
-  // Partition sB (N,K) by the cols of tC
   Tensor tCsB = local_partition(sB, tC, threadIdx.x, Step< X,_1>{});   // (8, 8)
-  // Partition gC (M,N) by the tile of tC
   // (128, 128) -> ((16, 16), (8, 8)) -> (8, 8)
   Tensor tCgC = local_partition(gC, tC, threadIdx.x, Step<_1,_1>{});   // (8, 8)
 
   // Allocate the accumulators -- same shape/layout as the partitioned data
-  Tensor tCrC = make_tensor_like(tCgC);                                // (thr_m,thr_k)
+  Tensor tCrC = make_tensor_like(tCgC);                                // (8, 8)
 
   CUTE_STATIC_ASSERT_V(size<0>(tCrC) == size<0>(tCgC));                // THR_M
   CUTE_STATIC_ASSERT_V(size<0>(tCrC) == size<0>(tCsA));                // THR_M
