@@ -67,6 +67,8 @@
 
 // Defines cutlass::gemm::device::Gemm, the generic Gemm computation template class.
 #include "cutlass/gemm/device/gemm.h"
+#include "cutlass/util/GPU_Clock.hpp"
+#include "cutlass/util/debug.h"
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 //
@@ -119,7 +121,7 @@ cudaError_t CutlassSgemmNN(
   // The benefits of this pattern are (1.) a structured, composable strategy for passing host-constructible
   // arguments to kernels and (2.) minimized initialization overhead on kernel entry.
   //
-  CutlassGemm::Arguments args({M , N, K},  // Gemm Problem dimensions
+  CutlassGemm::Arguments args({M, N, K},  // Gemm Problem dimensions
                               {A, lda},    // Tensor-ref for source matrix A
                               {B, ldb},    // Tensor-ref for source matrix B
                               {C, ldc},    // Tensor-ref for source matrix C
@@ -292,6 +294,7 @@ cudaError_t TestCutlassGemm(int M, int N, int K, float alpha, float beta) {
   //
 
   // Compute leading dimensions for each matrix.
+  std::cout << "M: " << M << " N: " << N << " K: " << K << std::endl;
   int lda = M;
   int ldb = K;
   int ldc = M;
@@ -358,6 +361,16 @@ cudaError_t TestCutlassGemm(int M, int N, int K, float alpha, float beta) {
   //
 
   result = CutlassSgemmNN(M, N, K, alpha, A, lda, B, ldb, beta, C_cutlass, ldc);
+  // profile the time
+  GPU_Clock gpu_clock;
+  // print matrix info 
+  gpu_clock.start();
+  for (int i = 0; i < 100; i++) {
+    result = CutlassSgemmNN(M, N, K, alpha, A, lda, B, ldb, beta, C_cutlass, ldc);
+  }
+  double time = gpu_clock.seconds() / 100 * 1000;
+  std::cout << "CUTLASS GEMM kernel time: " << time << " ms" << std::endl;
+  
 
   if (result != cudaSuccess) {
     std::cerr << "CUTLASS GEMM kernel failed: "
@@ -459,7 +472,7 @@ int main(int argc, const char *arg[]) {
   //
 
   // GEMM problem dimensions.
-  int problem[3] = { 128, 128, 128 };
+  int problem[3] = { 5120, 5120, 4096 };
 
   for (int i = 1; i < argc && i < 4; ++i) {
     std::stringstream ss(arg[i]);
